@@ -1,0 +1,26 @@
+{
+  "name": "fps-server",
+  "version": "0.1.0",
+  "private": true,
+  "main": "dist/index.js",
+  "types": "dist/index.d.ts",
+  "scripts": {
+    "build:addon": "node-gyp rebuild --directory addon",
+    "build": "npm run build:addon && tsc --project tsconfig.json",
+    "watch": "tsc --watch",
+    "start": "npm run build && node dist/index.js",
+    "dev": "npm-run-all --parallel watch start"
+  },
+  "dependencies": {
+    "node-addon-api": "^7.1.0",
+    "ws": "^8.18.0"
+  },
+  "devDependencies": {
+    "@types/ws": "^8.5.10",
+    "npm-run-all": "^4.1.5",
+    "typescript": "^5.3.3",
+    "@types/node": "^20.12.7",
+    "node-gyp": "^10.0.1"
+  },
+  "gypfile": true
+}
