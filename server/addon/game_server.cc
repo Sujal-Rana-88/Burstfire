@@ -13,22 +13,35 @@ float clampf(float v, float lo, float hi) { return std::max(lo, std::min(hi, v))
 struct GunDef {
     uint8_t id;
     const char *name;
-    float damage;
+    float maxDamage;
+    float minDamage;
     uint32_t cooldownTicks;
     float range;
+    float spread;
+    int pellets;
 };
 
-constexpr GunDef kGuns[] = {
-    {0, "SMG", 8.0f, 2, 40.0f},       // fast, low dmg
-    {1, "Assault", 18.0f, 5, 55.0f},  // balanced
-    {2, "Shotgun", 30.0f, 12, 25.0f}, // slow, short range
-    {3, "Sniper", 60.0f, 20, 90.0f},  // very slow, long range
-};
+constexpr GunDef kShotgun{0, "Pump Shotgun", 84.0f, 12.0f, 16, 22.0f, 0.07f, 8};
+
+namespace {
+// Safe spawn anchors roughly centered in rooms/corridors to avoid wall overlaps.
+constexpr std::array<std::pair<float, float>, 9> kSpawnPoints{{
+    {0.0f, 0.0f},
+    {0.0f, 12.0f},
+    {0.0f, -12.0f},
+    {-12.0f, 12.0f},
+    {12.0f, 12.0f},
+    {-12.0f, -12.0f},
+    {12.0f, -12.0f},
+    {0.0f, 18.0f},
+    {0.0f, -18.0f},
+}};
+}
 
 bool raySphereIntersect(const float ox, const float oy, const float oz,
                         const float dx, const float dy, const float dz,
                         const float cx, const float cy, const float cz,
-                        const float radius, float maxDist) {
+                        const float radius, float maxDist, float &hitDist) {
     // Ray origin o, direction d normalized. Sphere centered at c.
     const float lx = cx - ox;
     const float ly = cy - oy;
@@ -42,6 +55,7 @@ bool raySphereIntersect(const float ox, const float oy, const float oz,
     const float t0 = tca - thc;
     const float t1 = tca + thc;
     const float tHit = (t0 >= 0.0f) ? t0 : t1;
+    hitDist = tHit;
     return tHit >= 0.0f && tHit <= maxDist;
 }
 }
@@ -71,7 +85,7 @@ bool InputRing::pop(InputPacket &packet) {
 }
 
 GameServer::GameServer()
-    : running_(false), tickCount_(0), config_{64, 14.0f, 0} {}
+    : running_(false), tickCount_(0), config_{64, 24.0f, 0} {}
 
 GameServer::~GameServer() { stop(); }
 
@@ -162,7 +176,7 @@ void GameServer::processInput(const InputPacket &packet, float dt, std::vector<u
         newP.active = true;
         newP.lastSeq = packet.seq;
         newP.lastInputTick = tickCount_.load();
-        newP.weapon = packet.weapon < std::size(kGuns) ? packet.weapon : 0;
+        newP.weapon = 0;
         newP.isBot = false;
         respawnPlayer(newP);
         players_.push_back(newP);
@@ -179,7 +193,7 @@ void GameServer::processInput(const InputPacket &packet, float dt, std::vector<u
         return;
     }
 
-    player->weapon = packet.weapon < std::size(kGuns) ? packet.weapon : player->weapon;
+    player->weapon = 0; // only shotgun is available
     integratePlayer(*player, packet, dt);
     player->lastSeq = packet.seq;
     player->lastInputTick = tickCount_.load();
@@ -187,14 +201,34 @@ void GameServer::processInput(const InputPacket &packet, float dt, std::vector<u
 
     // Firing
     const uint32_t currentTick = tickCount_.load();
-    const GunDef &gun = kGuns[player->weapon % std::size(kGuns)];
+    const GunDef &gun = kShotgun;
     const uint32_t cooldown = gun.cooldownTicks;
     if (packet.fire && currentTick - player->lastFireTick >= cooldown) {
         player->lastFireTick = currentTick;
+        static thread_local std::mt19937 rng{std::random_device{}()};
+        std::uniform_real_distribution<float> jitter(-gun.spread, gun.spread);
         for (auto &target : players_) {
             if (!target.active || target.id == player->id || target.health <= 0) continue;
-            if (raycastHit(*player, target, gun.range)) {
-                target.health -= static_cast<int32_t>(gun.damage);
+            float totalDamage = 0.0f;
+            for (int pellet = 0; pellet < gun.pellets; ++pellet) {
+                const float yawOffset = jitter(rng);
+                const float pitchOffset = jitter(rng) * 0.6f;
+                const float yaw = player->yaw + yawOffset;
+                const float pitch = player->pitch + pitchOffset;
+                const float dirX = -std::sin(yaw) * std::cos(pitch);
+                const float dirY = std::sin(pitch);
+                const float dirZ = -std::cos(yaw) * std::cos(pitch);
+                float hitDist = 0.0f;
+                if (raycastHit(player->x, player->y, player->z, dirX, dirY, dirZ, target, gun.range, hitDist)) {
+                    const float t = clampf(1.0f - (hitDist / gun.range), 0.0f, 1.0f);
+                    const float pelletMax = gun.maxDamage / static_cast<float>(gun.pellets);
+                    const float pelletMin = gun.minDamage / static_cast<float>(gun.pellets);
+                    totalDamage += pelletMin + t * (pelletMax - pelletMin);
+                }
+            }
+            if (totalDamage > 0.0f) {
+                target.health -= static_cast<int32_t>(std::round(totalDamage));
+                target.health = std::max(0, target.health); // Clamp to prevent negative HP
                 if (target.health <= 0) {
                     target.active = false;
                     target.respawnTick = tickCount_.load() + 180; // 3s respawn
@@ -246,9 +280,26 @@ void GameServer::integratePlayer(PlayerState &p, const InputPacket &input, float
 
     p.x += p.vx * dt;
     p.z += p.vz * dt;
-    p.y = 1.0f; // fixed height for now
+
+    const float gravity = 26.0f;
+    const float jumpVel = 11.0f;
+    const float groundY = 1.0f;
+    bool onGround = p.y <= groundY + 0.05f;
+    if (input.jump && onGround) {
+        p.vy = jumpVel;
+        onGround = false;
+    }
+    p.vy -= gravity * dt;
+    p.y += p.vy * dt;
+    if (p.y < groundY) {
+        p.y = groundY;
+        p.vy = 0.0f;
+        onGround = true;
+    }
+    p.grounded = onGround;
 
     resolveWalls(p);
+    resolvePlatforms(p);
 
     // World bounds AABB clamp
     const float half = config_.worldHalfExtent;
@@ -261,19 +312,35 @@ void GameServer::integratePlayer(PlayerState &p, const InputPacket &input, float
 
 void GameServer::respawnPlayer(PlayerState &p) {
     static std::mt19937 rng{std::random_device{}()};
-    std::uniform_real_distribution<float> dist(-config_.worldHalfExtent + 1.0f, config_.worldHalfExtent - 1.0f);
-    // try to avoid spawning inside walls
-    for (int attempt = 0; attempt < 8; ++attempt) {
-        p.x = dist(rng);
-        p.z = dist(rng);
+    std::uniform_real_distribution<float> jitter(-1.2f, 1.2f);
+    // Try designated spawn points first
+    bool placed = false;
+    for (int attempt = 0; attempt < 12; ++attempt) {
+        const auto &base = kSpawnPoints[static_cast<size_t>(rng() % kSpawnPoints.size())];
+        p.x = base.first + jitter(rng);
+        p.z = base.second + jitter(rng);
         bool bad = false;
         for (const auto &w : walls_) {
-            if (overlapsWall(p, w)) {
-                bad = true;
-                break;
-            }
+            if (overlapsWall(p, w)) { bad = true; break; }
         }
-        if (!bad) break;
+        if (!bad) { placed = true; break; }
+    }
+    // Fallback random scatter if all anchors fail
+    if (!placed) {
+        std::uniform_real_distribution<float> dist(-config_.worldHalfExtent + 1.5f, config_.worldHalfExtent - 1.5f);
+        for (int attempt = 0; attempt < 20; ++attempt) {
+            p.x = dist(rng);
+            p.z = dist(rng);
+            bool bad = false;
+            for (const auto &w : walls_) {
+                if (overlapsWall(p, w)) { bad = true; break; }
+            }
+            if (!bad) { placed = true; break; }
+        }
+    }
+    if (!placed) {
+        p.x = 0.0f;
+        p.z = 0.0f;
     }
     p.y = 1.0f;
     p.vx = p.vy = p.vz = 0.0f;
@@ -281,15 +348,21 @@ void GameServer::respawnPlayer(PlayerState &p) {
     p.active = true;
     p.lastFireTick = 0;
     p.lastInputTick = tickCount_.load();
-    p.weapon = p.weapon % std::size(kGuns);
+    p.weapon = 0;
+    p.grounded = true;
 }
 
-bool GameServer::raycastHit(const PlayerState &shooter, const PlayerState &target, float maxDist) const {
-    const float dirX = -std::sin(shooter.yaw) * std::cos(shooter.pitch);
-    const float dirY = std::sin(shooter.pitch);
-    const float dirZ = -std::cos(shooter.yaw) * std::cos(shooter.pitch);
-    return raySphereIntersect(shooter.x, shooter.y, shooter.z, dirX, dirY, dirZ,
-                              target.x, target.y, target.z, 0.6f, maxDist);
+bool GameServer::raycastHit(const float ox, const float oy, const float oz,
+                            const float dirX, const float dirY, const float dirZ,
+                            const PlayerState &target, float maxDist, float &hitDist) const {
+    const float len = std::sqrt(dirX * dirX + dirY * dirY + dirZ * dirZ);
+    if (len < 1e-4f) return false;
+    const float inv = 1.0f / len;
+    const float dx = dirX * inv;
+    const float dy = dirY * inv;
+    const float dz = dirZ * inv;
+    return raySphereIntersect(ox, oy, oz, dx, dy, dz,
+                              target.x, target.y, target.z, 0.6f, maxDist, hitDist);
 }
 
 void GameServer::buildSnapshot() {
@@ -348,7 +421,7 @@ PlayerState *GameServer::ensureBot(uint32_t botId) {
     bot.active = true;
     bot.lastSeq = 0;
     bot.lastInputTick = tickCount_.load();
-    bot.weapon = botId % std::size(kGuns); // vary weapon per bot
+    bot.weapon = 0;
     bot.isBot = true;
     respawnPlayer(bot);
     players_.push_back(bot);
@@ -381,7 +454,7 @@ void GameServer::updateBots(float dt, std::vector<uint32_t> &touched) {
         InputPacket ai{};
         ai.playerId = botId;
         ai.seq = tickCount_.load();
-        ai.weapon = bot->weapon;
+        ai.weapon = 0;
         if (target) {
             const float dx = target->x - bot->x;
             const float dz = target->z - bot->z;
@@ -391,7 +464,7 @@ void GameServer::updateBots(float dt, std::vector<uint32_t> &touched) {
             // move toward but strafe a bit
             ai.moveZ = dist > 2.5f ? 1.0f : 0.0f;
             ai.moveX = (tickCount_.load() / 60) % 2 == 0 ? 0.5f : -0.5f;
-            ai.fire = dist < kGuns[bot->weapon].range * 0.9f;
+            ai.fire = dist < kShotgun.range * 0.9f;
         } else {
             ai.yaw = bot->yaw;
             ai.pitch = bot->pitch;
@@ -403,20 +476,154 @@ void GameServer::updateBots(float dt, std::vector<uint32_t> &touched) {
     }
 }
 
+void GameServer::updateSpiders(float dt, std::vector<uint32_t> &touched) {
+    const uint32_t tick = tickCount_.load();
+    for (auto &spider : spiders_) {
+        if (!spider.active) continue;
+
+        // Find nearest player within aggro range
+        PlayerState *target = findNearestPlayer(spider);
+
+        if (target) {
+            spider.targetPlayerId = target->id;
+            const float dx = target->x - spider.x;
+            const float dz = target->z - spider.z;
+            const float dist = std::sqrt(dx * dx + dz * dz);
+
+            // Move toward player
+            if (dist > spider.attackRange) {
+                spider.yaw = std::atan2(-dx, -dz);
+                const float dirX = dx / dist;
+                const float dirZ = dz / dist;
+                spider.vx = dirX * spider.moveSpeed;
+                spider.vz = dirZ * spider.moveSpeed;
+                spider.x += spider.vx * dt;
+                spider.z += spider.vz * dt;
+
+                // Clamp to world bounds
+                const float h = config_.worldHalfExtent;
+                spider.x = clampf(spider.x, -h, h);
+                spider.z = clampf(spider.z, -h, h);
+
+                // Resolve wall collisions
+                resolveSpiderWalls(spider);
+            } else {
+                // In attack range - deal damage
+                if (tick - spider.lastAttackTick >= spider.attackCooldownTicks) {
+                    target->health -= spider.attackDamage;
+                    spider.lastAttackTick = tick;
+                    if (target->health <= 0) {
+                        target->active = false;
+                        target->respawnTick = tick + 180;
+                    }
+                }
+                spider.vx = 0.0f;
+                spider.vz = 0.0f;
+            }
+        } else {
+            // No target - idle
+            spider.targetPlayerId = 0;
+            spider.vx = 0.0f;
+            spider.vz = 0.0f;
+        }
+
+        // Keep spider grounded
+        spider.y = 0.3f;
+    }
+}
+
+PlayerState *GameServer::findNearestPlayer(const SpiderEntity &spider) {
+    PlayerState *target = nullptr;
+    float bestDist2 = spider.aggroRange * spider.aggroRange;
+    for (auto &p : players_) {
+        if (!p.active || p.health <= 0) continue;
+        const float dx = p.x - spider.x;
+        const float dz = p.z - spider.z;
+        const float d2 = dx * dx + dz * dz;
+        if (d2 < bestDist2) {
+            bestDist2 = d2;
+            target = &p;
+        }
+    }
+    return target;
+}
+
+void GameServer::spawnSpider(float x, float z) {
+    SpiderEntity spider{};
+    spider.id = nextSpiderId_++;
+    spider.x = x;
+    spider.y = 0.3f;
+    spider.z = z;
+    spider.vx = 0.0f;
+    spider.vz = 0.0f;
+    spider.yaw = 0.0f;
+    spider.health = 80;
+    spider.active = true;
+    spider.targetPlayerId = 0;
+    spider.lastAttackTick = 0;
+    spiders_.push_back(spider);
+}
+
+void GameServer::resolveSpiderWalls(SpiderEntity &spider) {
+    const float r = spiderRadius_;
+    for (const auto &w : walls_) {
+        if (spider.x + r > w.minX && spider.x - r < w.maxX &&
+            spider.z + r > w.minZ && spider.z - r < w.maxZ) {
+            // Push out of wall
+            const float overlapX = std::min(spider.x + r - w.minX, w.maxX - (spider.x - r));
+            const float overlapZ = std::min(spider.z + r - w.minZ, w.maxZ - (spider.z - r));
+            if (overlapX < overlapZ) {
+                if (spider.x < (w.minX + w.maxX) / 2.0f) {
+                    spider.x = w.minX - r - 0.01f;
+                } else {
+                    spider.x = w.maxX + r + 0.01f;
+                }
+            } else {
+                if (spider.z < (w.minZ + w.maxZ) / 2.0f) {
+                    spider.z = w.minZ - r - 0.01f;
+                } else {
+                    spider.z = w.maxZ + r + 0.01f;
+                }
+            }
+        }
+    }
+}
+
 void GameServer::setupMap() {
     walls_.clear();
+    platforms_.clear();
     const float h = config_.worldHalfExtent;
-    // Perimeter thickening
+    // Perimeter
     walls_.push_back({-h, h, h - 1.0f, h});      // north
     walls_.push_back({-h, h, -h, -h + 1.0f});    // south
     walls_.push_back({-h, -h + 1.0f, -h, h});    // west
     walls_.push_back({h - 1.0f, h, -h, h});      // east
-    // Interior blocks
-    walls_.push_back({-3.0f, 3.0f, -1.0f, 1.0f});
-    walls_.push_back({-8.0f, -4.0f, 4.0f, 8.0f});
-    walls_.push_back({4.0f, 8.0f, -8.0f, -4.0f});
-    walls_.push_back({-10.0f, -6.0f, -8.0f, -6.0f});
-    walls_.push_back({6.0f, 10.0f, 6.0f, 8.0f});
+    // Upper (north) room shell with wide doorway on south edge
+    walls_.push_back({-18.0f, 18.0f, 18.0f, 20.0f});   // north wall
+    walls_.push_back({-18.0f, -6.0f, 10.0f, 12.0f});   // south left
+    walls_.push_back({6.0f, 18.0f, 10.0f, 12.0f});     // south right
+    walls_.push_back({-18.0f, -16.0f, 10.0f, 20.0f});  // west wall
+    walls_.push_back({16.0f, 18.0f, 10.0f, 20.0f});    // east wall
+
+    // Lower (south) room shell with wide doorway on north edge
+    walls_.push_back({-18.0f, 18.0f, -20.0f, -18.0f}); // south wall
+    walls_.push_back({-18.0f, -6.0f, -12.0f, -10.0f}); // north left
+    walls_.push_back({6.0f, 18.0f, -12.0f, -10.0f});   // north right
+    walls_.push_back({-18.0f, -16.0f, -20.0f, -10.0f}); // west wall
+    walls_.push_back({16.0f, 18.0f, -20.0f, -10.0f});   // east wall
+
+    // Platforms (crates) players can stand on
+    auto addPlatform = [&](float cx, float cz, float halfSize, float height) {
+        platforms_.push_back({cx - halfSize, cx + halfSize, cz - halfSize, cz + halfSize, height});
+    };
+    addPlatform(-14.0f, -14.0f, 0.7f, 1.4f);
+    addPlatform(14.0f, 14.0f, 0.7f, 1.4f);
+    addPlatform(-5.0f, -17.0f, 0.7f, 1.4f);
+    addPlatform(5.0f, 17.0f, 0.7f, 1.4f);
+    addPlatform(0.0f, 0.0f, 0.7f, 1.4f);
+
+    // Clear spiders
+    spiders_.clear();
 }
 
 bool GameServer::overlapsWall(const PlayerState &p, const Wall &w) const {
@@ -443,6 +650,38 @@ void GameServer::resolveWalls(PlayerState &p) {
             case 1: p.x = w.minX - r; p.vx = 0.0f; break;
             case 2: p.z = w.minZ - r; p.vz = 0.0f; break;
             case 3: p.z = w.maxZ + r; p.vz = 0.0f; break;
+        }
+    }
+}
+
+void GameServer::resolvePlatforms(PlayerState &p) {
+    for (const auto &pl : platforms_) {
+        const bool insideXZ = (p.x + playerRadius_ > pl.minX && p.x - playerRadius_ < pl.maxX &&
+                               p.z + playerRadius_ > pl.minZ && p.z - playerRadius_ < pl.maxZ);
+        if (!insideXZ) continue;
+        // Landing on top
+        const float top = pl.height;
+        if (p.vy < 0.0f && p.y <= top + 0.2f && p.y >= top - 0.8f) {
+            p.y = top;
+            p.vy = 0.0f;
+            p.grounded = true;
+        }
+        // Side collision only when below top to allow movement on top
+        if (p.y > top + 0.2f) continue;
+        const float penLeft = (pl.maxX - (p.x - playerRadius_));
+        const float penRight = ((p.x + playerRadius_) - pl.minX);
+        const float penDown = ((p.z + playerRadius_) - pl.minZ);
+        const float penUp = (pl.maxZ - (p.z - playerRadius_));
+        float minPen = penLeft;
+        int axis = 0;
+        if (penRight < minPen) { minPen = penRight; axis = 1; }
+        if (penDown < minPen) { minPen = penDown; axis = 2; }
+        if (penUp < minPen) { minPen = penUp; axis = 3; }
+        switch (axis) {
+            case 0: p.x = pl.maxX + playerRadius_; p.vx = 0.0f; break;
+            case 1: p.x = pl.minX - playerRadius_; p.vx = 0.0f; break;
+            case 2: p.z = pl.minZ - playerRadius_; p.vz = 0.0f; break;
+            case 3: p.z = pl.maxZ + playerRadius_; p.vz = 0.0f; break;
         }
     }
 }

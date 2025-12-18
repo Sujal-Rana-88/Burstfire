@@ -3,7 +3,8 @@ import { NetServer } from "./net";
 
 const port = Number(process.env.PORT || 8080);
 
-gameBridge.start({ maxPlayers: 64, worldHalfExtent: 14, botCount: 0 });
+// DOOM-like arena footprint.
+gameBridge.start({ maxPlayers: 64, worldHalfExtent: 24, botCount: 0 });
 const net = new NetServer();
 net.start(port);
 

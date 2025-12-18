@@ -11,8 +11,8 @@
         width: 100%;
         height: 100%;
         overflow: hidden;
-        background: #080b12;
-        color: #e4e8f0;
+        background: #0f0a0a;
+        color: #f4d7c2;
         font-family: "Segoe UI", sans-serif;
       }
       #hud {
@@ -27,24 +27,41 @@
         font-size: 14px;
       }
       #health {
-        color: #4ade80;
+        color: #f97316;
       }
       #status {
-        color: #9ca3af;
+        color: #c08484;
       }
       canvas { display: block; }
       #crosshair {
         position: absolute;
         top: 50%;
         left: 50%;
-        width: 16px;
-        height: 16px;
-        margin-left: -8px;
-        margin-top: -8px;
-        border-radius: 50%;
-        box-shadow: 0 0 0 2px #e4e8f0 inset;
+        width: 26px;
+        height: 26px;
+        margin-left: -13px;
+        margin-top: -13px;
         pointer-events: none;
-        opacity: 0.8;
+      }
+      #crosshair::before,
+      #crosshair::after {
+        content: "";
+        position: absolute;
+        background: #f4d7c2;
+      }
+      #crosshair::before {
+        left: 50%;
+        top: 0;
+        width: 2px;
+        height: 100%;
+        transform: translateX(-50%);
+      }
+      #crosshair::after {
+        top: 50%;
+        left: 0;
+        width: 100%;
+        height: 2px;
+        transform: translateY(-50%);
       }
       #overlay {
         position: absolute;

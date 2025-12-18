@@ -7,7 +7,7 @@ const renderer = new Renderer();
 const input = new InputController(renderer.getCanvas());
 const predictor = new Predictor();
 const net = new NetClient(`ws://${location.hostname}:8080`);
-const weaponNames = ["SMG", "Assault", "Shotgun", "Sniper"];
+const weaponNames = ["Pump Shotgun"];
 
 let playerId: number | null = null;
 let lastSnap: Snapshot | null = null;
@@ -58,9 +58,13 @@ function loop(now: number) {
       frameInput.yaw,
       frameInput.pitch,
       frameInput.fire,
-      frameInput.weapon
+      frameInput.weapon,
+      frameInput.jump
     );
     predictor.enqueueAndPredict(cmd);
+    if (frameInput.fire) {
+      renderer.triggerShotgunFire();
+    }
     accumulator -= FIXED;
   }
 
@@ -68,9 +72,8 @@ function loop(now: number) {
   if (local) {
     renderer.setCameraPose(local.x, local.y, local.z, local.yaw, local.pitch);
     healthEl.textContent = `HP: ${predictor.getHealth()}`;
-    const wName = weaponNames[local.weapon] ?? "Rifle";
-    statusEl.textContent = `Weapon: ${wName} ${local.isBot ? "(bot)" : ""}`;
-    renderer.setGunWeapon(local.weapon);
+    const wName = weaponNames[local.weapon] ?? "Shotgun";
+    statusEl.textContent = `${wName} | Jump: Space | Fire: LMB`;
   }
 
   if (lastSnap) {
