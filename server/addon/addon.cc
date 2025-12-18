@@ -3,7 +3,7 @@
 
 namespace {
 GameServer gServer;
-GameConfig gConfig{64, 20.0f};
+GameConfig gConfig{64, 24.0f, 0};
 }
 
 Napi::Value StartServer(const Napi::CallbackInfo &info) {
@@ -49,7 +49,7 @@ Napi::Value PushInput(const Napi::CallbackInfo &info) {
 
     const uint8_t *data = static_cast<const uint8_t *>(buf.Data()) + offset;
     const size_t len = buf.ByteLength() - offset;
-    if (len < 22) {
+    if (len < 23) {
         return Napi::Boolean::New(env, false);
     }
 
@@ -77,6 +77,8 @@ Napi::Value PushInput(const Napi::CallbackInfo &info) {
     pkt.fire = data[idx] != 0;
     idx += 1;
     pkt.weapon = data[idx];
+    idx += 1;
+    pkt.jump = idx < len ? (data[idx] != 0) : false;
 
     bool ok = gServer.pushInput(pkt);
     return Napi::Boolean::New(env, ok);

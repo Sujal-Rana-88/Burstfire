@@ -42,9 +42,9 @@ export class NetClient {
     this.ws.onerror = (e) => console.error("[net] error", e);
   }
 
-  sendInput(seq: number, moveX: number, moveZ: number, yaw: number, pitch: number, fire: boolean, weapon: number) {
+  sendInput(seq: number, moveX: number, moveZ: number, yaw: number, pitch: number, fire: boolean, weapon: number, jump: boolean) {
     if (!this.ws || this.ws.readyState !== WebSocket.OPEN) return;
-    const buf = new ArrayBuffer(22);
+    const buf = new ArrayBuffer(23);
     const view = new DataView(buf);
     let offset = 0;
     view.setUint32(offset, seq, true);
@@ -60,6 +60,8 @@ export class NetClient {
     view.setUint8(offset, fire ? 1 : 0);
     offset += 1;
     view.setUint8(offset, weapon);
+    offset += 1;
+    view.setUint8(offset, jump ? 1 : 0);
     this.ws.send(buf);
   }
 
@@ -125,6 +127,7 @@ export class NetClient {
       offset += 4;
       players.push({ id, x, y, z, vx, vy, vz, yaw, pitch, health, active, isBot, weapon, lastSeq });
     }
+
     return { tick, players };
   }
 }

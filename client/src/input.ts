@@ -8,6 +8,7 @@ export interface InputState {
   pitch: number;
   fire: boolean;
   weapon: number;
+  jump: boolean;
 }
 
 export class InputController {
@@ -17,6 +18,7 @@ export class InputController {
   private fireQueued = false;
   private locked = false;
   private weapon = 0;
+  private jump = false;
 
   constructor(private element: HTMLElement) {
     this.bindEvents();
@@ -35,7 +37,7 @@ export class InputController {
     const moveZ = (this.keys.has("w") ? 1 : 0) + (this.keys.has("s") ? -1 : 0);
     const fire = this.fireQueued;
     this.fireQueued = false;
-    return { moveX, moveZ, yaw: this.yaw, pitch: this.pitch, fire, weapon: this.weapon };
+    return { moveX, moveZ, yaw: this.yaw, pitch: this.pitch, fire, weapon: this.weapon, jump: this.jump };
   }
 
   requestLock() {
@@ -52,18 +54,17 @@ export class InputController {
       if (["w", "a", "s", "d"].includes(key)) {
         this.keys.add(key);
       }
-      if (key === " ") {
-        this.fireQueued = true;
+      if (key === " " || key === "space") {
+        this.jump = true;
       }
-      if (key === "1") this.weapon = 0;
-      if (key === "2") this.weapon = 1;
-      if (key === "3") this.weapon = 2;
-      if (key === "4") this.weapon = 3;
     });
     window.addEventListener("keyup", (e) => {
       const key = e.key.toLowerCase();
       if (["w", "a", "s", "d"].includes(key)) {
         this.keys.delete(key);
+      }
+      if (key === " " || key === "space") {
+        this.jump = false;
       }
     });
     window.addEventListener("mousedown", () => {
