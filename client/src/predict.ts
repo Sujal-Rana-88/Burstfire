@@ -1,4 +1,5 @@
 import { RemotePlayer, Snapshot } from "./net";
+import { ALL_WALLS, PLATFORM_RECTS, WORLD_HALF } from "./map";
 
 export interface Command {
   seq: number;
@@ -17,34 +18,12 @@ const FIXED_DT = 1 / 60;
 const MAX_SPEED = 12;
 const ACCEL = 50;
 const FRICTION = 8;
-const WORLD_HALF = 24;
 const PLAYER_RADIUS = 0.35;
 const GRAVITY = 26;
 const JUMP_VEL = 11;
-const GROUND_Y = 1;
-const WALLS: Array<[number, number, number, number]> = [
-  [-WORLD_HALF, WORLD_HALF, WORLD_HALF - 1, WORLD_HALF],
-  [-WORLD_HALF, WORLD_HALF, -WORLD_HALF, -WORLD_HALF + 1],
-  [-WORLD_HALF, -WORLD_HALF + 1, -WORLD_HALF, WORLD_HALF],
-  [WORLD_HALF - 1, WORLD_HALF, -WORLD_HALF, WORLD_HALF],
-  [-18, 18, 18, 20],
-  [-18, -6, 10, 12],
-  [6, 18, 10, 12],
-  [-18, -16, 10, 20],
-  [16, 18, 10, 20],
-  [-18, 18, -20, -18],
-  [-18, -6, -12, -10],
-  [6, 18, -12, -10],
-  [-18, -16, -20, -10],
-  [16, 18, -20, -10],
-];
-const PLATFORMS: Array<[number, number, number, number, number]> = [
-  [-14.7, -13.3, -14.7, -13.3, 1.4],
-  [13.3, 14.7, 13.3, 14.7, 1.4],
-  [-5.7, -4.3, -17.7, -16.3, 1.4],
-  [4.3, 5.7, 16.3, 17.7, 1.4],
-  [-0.7, 0.7, -0.7, 0.7, 1.4],
-];
+const GROUND_Y = 1.2; // Match server ground so we don't drift below the PSU floor
+const WALLS: Array<[number, number, number, number]> = ALL_WALLS;
+const PLATFORMS: Array<[number, number, number, number, number]> = PLATFORM_RECTS.map((p) => [p.minX, p.maxX, p.minZ, p.maxZ, p.h]);
 
 export class Predictor {
   private seq = 1;
