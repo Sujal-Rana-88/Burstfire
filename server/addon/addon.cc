@@ -3,7 +3,7 @@
 
 namespace {
 GameServer gServer;
-GameConfig gConfig{64, 24.0f, 0};
+GameConfig gConfig{64, 40.0f, 0};
 }
 
 Napi::Value StartServer(const Napi::CallbackInfo &info) {

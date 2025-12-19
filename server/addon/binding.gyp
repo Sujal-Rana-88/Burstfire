@@ -2,7 +2,13 @@
   "targets": [
     {
       "target_name": "addon",
-      "sources": ["addon.cc", "game_server.cc"],
+      "sources": [
+        "addon.cc",
+        "game_server.cc",
+        "game_server_ai.cc",
+        "game_server_players.cc",
+        "game_server_world.cc"
+      ],
       "include_dirs": [
         "<(module_root_dir)/../node_modules/node-addon-api"
       ],

@@ -1,10 +1,14 @@
 import * as THREE from "three";
 import { GLTFLoader, type GLTF } from "three/examples/jsm/loaders/GLTFLoader.js";
+import { DRACOLoader } from "three/examples/jsm/loaders/DRACOLoader.js";
 import * as SkeletonUtils from "three/examples/jsm/utils/SkeletonUtils.js";
+import { RoomEnvironment } from "three/examples/jsm/environments/RoomEnvironment.js";
+import { EffectComposer } from "three/examples/jsm/postprocessing/EffectComposer.js";
+import { RenderPass } from "three/examples/jsm/postprocessing/RenderPass.js";
+import { UnrealBloomPass } from "three/examples/jsm/postprocessing/UnrealBloomPass.js";
 import { RemotePlayer } from "./net";
 import { AnimationManager } from "./animation";
-
-type WallRect = [number, number, number, number];
+import { WORLD_HALF } from "./map";
 
 interface MeshEntry {
   mesh: THREE.Group;
@@ -15,86 +19,18 @@ interface MeshEntry {
   animManager?: AnimationManager;
 }
 
-const WORLD_HALF = 24;
-const ARENA_SIZE = WORLD_HALF * 2;
-const WALL_RECTS: WallRect[] = [
-  [-18, 18, 18, 20],
-  [-18, -6, 10, 12],
-  [6, 18, 10, 12],
-  [-18, -16, 10, 20],
-  [16, 18, 10, 20],
-  [-18, 18, -20, -18],
-  [-18, -6, -12, -10],
-  [6, 18, -12, -10],
-  [-18, -16, -20, -10],
-  [16, 18, -20, -10],
-];
-const PLATFORM_RECTS: Array<{ minX: number; maxX: number; minZ: number; maxZ: number; h: number }> = [
-  { minX: -14.7, maxX: -13.3, minZ: -14.7, maxZ: -13.3, h: 1.4 },
-  { minX: 13.3, maxX: 14.7, minZ: 13.3, maxZ: 14.7, h: 1.4 },
-  { minX: -5.7, maxX: -4.3, minZ: -17.7, maxZ: -16.3, h: 1.4 },
-  { minX: 4.3, maxX: 5.7, minZ: 16.3, maxZ: 17.7, h: 1.4 },
-  { minX: -0.7, maxX: 0.7, minZ: -0.7, maxZ: 0.7, h: 1.4 },
-];
-
 const HUMAN_COLOR = 0x5f6c4d; // DOOM-ish marine green
 const BOT_COLOR = 0xc46a24;
 
-function makeNoiseTexture(color: THREE.ColorRepresentation, scale = 4, contrast = 0.22) {
-  const size = 128;
-  const canvas = document.createElement("canvas");
-  canvas.width = canvas.height = size;
-  const ctx = canvas.getContext("2d")!;
-  const base = new THREE.Color(color);
-  const imageData = ctx.createImageData(size, size);
-  for (let y = 0; y < size; y++) {
-    for (let x = 0; x < size; x++) {
-      const idx = (y * size + x) * 4;
-      const n = Math.random() * contrast;
-      const r = Math.floor((base.r + n) * 255);
-      const g = Math.floor((base.g + n) * 255);
-      const b = Math.floor((base.b + n) * 255);
-      imageData.data[idx] = r;
-      imageData.data[idx + 1] = g;
-      imageData.data[idx + 2] = b;
-      imageData.data[idx + 3] = 255;
-    }
-  }
-  ctx.putImageData(imageData, 0, 0);
-  const tex = new THREE.CanvasTexture(canvas);
-  tex.wrapS = tex.wrapT = THREE.RepeatWrapping;
-  tex.repeat.set(scale, scale);
-  tex.needsUpdate = true;
-  return tex;
-}
-
-function makeStripedTexture(color1: THREE.ColorRepresentation, color2: THREE.ColorRepresentation, stripe = 8, scale = 4) {
-  const size = 128;
-  const canvas = document.createElement("canvas");
-  canvas.width = canvas.height = size;
-  const ctx = canvas.getContext("2d")!;
-  const c1 = new THREE.Color(color1);
-  const c2 = new THREE.Color(color2);
-  for (let y = 0; y < size; y++) {
-    for (let x = 0; x < size; x++) {
-      const use1 = Math.floor(x / stripe) % 2 === 0;
-      ctx.fillStyle = use1 ? `rgb(${Math.floor(c1.r * 255)},${Math.floor(c1.g * 255)},${Math.floor(c1.b * 255)})`
-        : `rgb(${Math.floor(c2.r * 255)},${Math.floor(c2.g * 255)},${Math.floor(c2.b * 255)})`;
-      ctx.fillRect(x, y, 1, 1);
-    }
-  }
-  const tex = new THREE.CanvasTexture(canvas);
-  tex.wrapS = tex.wrapT = THREE.RepeatWrapping;
-  tex.repeat.set(scale, scale);
-  tex.needsUpdate = true;
-  return tex;
-}
+// Removed: texture generation functions - not needed for simple city map
 
 export class Renderer {
   private scene = new THREE.Scene();
   private camera = new THREE.PerspectiveCamera(75, window.innerWidth / window.innerHeight, 0.1, 260);
   private renderer = new THREE.WebGLRenderer({ antialias: true });
   private clock = new THREE.Clock();
+  private composer!: EffectComposer;
+  private bloomPass!: UnrealBloomPass;
   private playerMeshes: Map<number, MeshEntry> = new Map();
   private baseModel: THREE.Group | null = null;
   private baseModelGltf: GLTF | null = null;
@@ -105,24 +41,45 @@ export class Renderer {
   private pumpTime = 0;
   private muzzleTime = 0;
   private recoil = 0;
-  private wallHeight = 3.6;
   private listener = new THREE.AudioListener();
   private shotSound: THREE.Audio | null = null;
   private pumpSound: THREE.Audio | null = null;
+  private cityGroup = new THREE.Group(); // Container for generated city scene
 
   constructor() {
+    this.renderer.physicallyCorrectLights = true;
+    this.renderer.toneMapping = THREE.ACESFilmicToneMapping;
+    this.renderer.toneMappingExposure = 1.05;
+    this.renderer.outputColorSpace = THREE.SRGBColorSpace;
     this.renderer.setSize(window.innerWidth, window.innerHeight);
     this.renderer.setPixelRatio(Math.min(window.devicePixelRatio, 2));
     this.renderer.shadowMap.enabled = true;
     this.renderer.shadowMap.type = THREE.PCFSoftShadowMap;
     document.body.appendChild(this.renderer.domElement);
 
+    // Subtle HDR room environment for believable metal reflections
+    const pmrem = new THREE.PMREMGenerator(this.renderer);
+    const envTex = pmrem.fromScene(new RoomEnvironment(), 0.04).texture;
+    this.scene.environment = envTex;
+    pmrem.dispose();
+
+    this.composer = new EffectComposer(this.renderer);
+    const renderPass = new RenderPass(this.scene, this.camera);
+    this.bloomPass = new UnrealBloomPass(new THREE.Vector2(window.innerWidth, window.innerHeight), 0.35, 0.28, 0.82);
+    this.bloomPass.threshold = 0.75;
+    this.bloomPass.strength = 0.42;
+    this.bloomPass.radius = 0.62;
+    this.composer.addPass(renderPass);
+    this.composer.addPass(this.bloomPass);
+
     this.camera.add(this.listener);
-    this.scene.background = new THREE.Color(0x0a0404); // Darker Doom-style background
-    this.scene.fog = new THREE.Fog(0x0a0404, 12, WORLD_HALF * 2.2); // Thicker fog starting closer
+    this.scene.background = new THREE.Color(0x87ceeb); // Sky blue for campus
+    this.scene.fog = new THREE.Fog(0x87ceeb, 50, WORLD_HALF * 3.5);
+    this.scene.add(this.cityGroup); // Add city container to scene
 
     this.addLights();
-    this.buildEnvironment();
+    this.buildSky();
+    this.buildCity(); // Build simple city block map
     this.buildGun();
     this.loadCharacterModel();
     this.loadAudio();
@@ -162,7 +119,9 @@ export class Renderer {
 
       let entry = this.playerMeshes.get(p.id);
       if (!entry) {
-        entry = this.createPlayerMesh();
+        const created = this.createPlayerMesh();
+        if (!created) continue; // model not ready yet
+        entry = created;
         this.playerMeshes.set(p.id, entry);
         this.scene.add(entry.mesh);
       }
@@ -176,15 +135,18 @@ export class Renderer {
       }
 
       const speed = Math.hypot(p.vx, p.vz);
+      const airborne = Math.abs(p.vy) > 1.2 && p.y > 1.2;
 
       // Update animation based on velocity
       if (entry.animManager) {
-        if (speed > 5) {
-          entry.animManager.playAnimation("run", true);
-        } else if (speed > 0.5) {
-          entry.animManager.playAnimation("walk", true);
+        if (airborne && entry.animManager.hasAnimation("Jump")) {
+          entry.animManager.playAnimation("Jump", false);
+        } else if (speed > 5 && entry.animManager.hasAnimation("Running")) {
+          entry.animManager.playAnimation("Running", true);
+        } else if (speed > 0.5 && entry.animManager.hasAnimation("Walking")) {
+          entry.animManager.playAnimation("Walking", true);
         } else {
-          entry.animManager.playAnimation("idle", true);
+          entry.animManager.playAnimation("Idle", true);
         }
       }
 
@@ -205,7 +167,7 @@ export class Renderer {
   render() {
     const delta = this.clock.getDelta();
     this.updateAnimations(delta);
-    this.renderer.render(this.scene, this.camera);
+    this.composer.render(delta);
   }
 
   getCanvas(): HTMLCanvasElement {
@@ -213,159 +175,184 @@ export class Renderer {
   }
 
   private addLights() {
-    // Darker, more atmospheric Doom-style lighting
-    const hemi = new THREE.HemisphereLight(0xaa6644, 0x0a0404, 0.35); // Dimmer, warmer
+    // Bright ambient light for campus visibility
+    const ambient = new THREE.AmbientLight(0xffffff, 0.6);
+    this.scene.add(ambient);
+
+    // Bright hemisphere light simulating sky
+    const hemi = new THREE.HemisphereLight(0xffffff, 0x444444, 0.8);
     this.scene.add(hemi);
 
-    // Main directional light - much dimmer
-    const dir = new THREE.DirectionalLight(0xffcc88, 0.3);
-    dir.position.set(14, 18, 10);
-    dir.castShadow = true;
-    dir.shadow.mapSize.set(2048, 2048);
-    dir.shadow.camera.left = -34;
-    dir.shadow.camera.right = 34;
-    dir.shadow.camera.top = 34;
-    dir.shadow.camera.bottom = -34;
-    dir.shadow.bias = -0.001;
-    this.scene.add(dir);
+    // Main directional sun light
+    const sun = new THREE.DirectionalLight(0xffffff, 1.2);
+    sun.position.set(50, 100, 50);
+    sun.castShadow = true;
+    sun.shadow.mapSize.set(2048, 2048);
+    sun.shadow.camera.left = -80;
+    sun.shadow.camera.right = 80;
+    sun.shadow.camera.top = 80;
+    sun.shadow.camera.bottom = -80;
+    sun.shadow.camera.near = 0.5;
+    sun.shadow.camera.far = 500;
+    sun.shadow.bias = -0.0001;
+    this.scene.add(sun);
 
-    // Enhanced lava glow - more intense red/orange
-    const lavaGlow = new THREE.PointLight(0xff2200, 2.5, 40, 2.5);
-    lavaGlow.position.set(-8, 2.8, 0);
-    lavaGlow.castShadow = true;
-    this.scene.add(lavaGlow);
-
-    // Exit glow - keep similar
-    const exitGlow = new THREE.PointLight(0xdd1111, 1.2, 32, 2.0);
-    exitGlow.position.set(10, 3.2, 12);
-    this.scene.add(exitGlow);
-
-    // Add flickering torch lights in corners for Doom atmosphere
-    const torchPositions = [
-      [-20, 2.5, -20],
-      [20, 2.5, -20],
-      [-20, 2.5, 20],
-      [20, 2.5, 20]
-    ];
-
-    torchPositions.forEach(([x, y, z]) => {
-      const torch = new THREE.PointLight(0xff8833, 1.5, 25, 2.2);
-      torch.position.set(x, y, z);
-      this.scene.add(torch);
-    });
+    // Fill light from opposite direction
+    const fillLight = new THREE.DirectionalLight(0xffffff, 0.4);
+    fillLight.position.set(-50, 50, -50);
+    this.scene.add(fillLight);
   }
 
-  private buildEnvironment() {
-    // Doom-style metal floor with darker tones
-    const floorTex = makeStripedTexture(0x1a1512, 0x0f0c0a, 8, 12);
-    const floorMat = new THREE.MeshStandardMaterial({
-      map: floorTex,
-      metalness: 0.6,
-      roughness: 0.4,
-      emissive: 0x0a0606,
-      emissiveIntensity: 0.1
-    });
-    const floor = new THREE.Mesh(new THREE.PlaneGeometry(ARENA_SIZE, ARENA_SIZE, 1, 1), floorMat);
-    floor.rotation.x = -Math.PI / 2;
-    floor.receiveShadow = true;
-    this.scene.add(floor);
+  // Procedural city block with road, sidewalks, benches, and simple buildings
+  private buildCity() {
+    this.cityGroup.clear();
 
-    // Darker grid for Doom aesthetic
-    const grid = new THREE.GridHelper(ARENA_SIZE, 32, 0x1a0808, 0x0a0404);
-    grid.position.y = 0.02;
-    this.scene.add(grid);
+    // Base ground
+    const groundMat = new THREE.MeshStandardMaterial({ color: 0x7fa66b, roughness: 0.9, metalness: 0.05 });
+    const ground = new THREE.Mesh(new THREE.PlaneGeometry(WORLD_HALF * 2, WORLD_HALF * 2), groundMat);
+    ground.rotation.x = -Math.PI / 2;
+    ground.receiveShadow = true;
+    this.cityGroup.add(ground);
 
-    // Doom-style stone walls with red tint
-    const wallTex = makeNoiseTexture(0x2a1410, 8, 0.25);
-    const wallMat = new THREE.MeshStandardMaterial({
-      map: wallTex,
-      metalness: 0.1,
-      roughness: 0.8,
-      emissive: 0x220a0a,
-      emissiveIntensity: 0.15
-    });
-    this.buildPerimeter(wallMat);
-    for (const rect of WALL_RECTS) {
-      this.scene.add(this.makeWall(rect, wallMat));
+    // Road strip through center
+    const roadMat = new THREE.MeshStandardMaterial({ color: 0x2d2d30, roughness: 0.85, metalness: 0.05 });
+    const road = new THREE.Mesh(new THREE.PlaneGeometry(WORLD_HALF * 2, 10), roadMat);
+    road.rotation.x = -Math.PI / 2;
+    road.position.y = 0.01;
+    road.receiveShadow = true;
+    this.cityGroup.add(road);
+
+    // Sidewalks along road
+    const sidewalkMat = new THREE.MeshStandardMaterial({ color: 0xb0b5b8, roughness: 0.7, metalness: 0.05 });
+    const sidewalkWidth = 4;
+    const sidewalkLen = WORLD_HALF * 2;
+    const sidewalkL = new THREE.Mesh(new THREE.BoxGeometry(sidewalkLen, 0.3, sidewalkWidth), sidewalkMat);
+    sidewalkL.position.set(0, 0.15, -7);
+    sidewalkL.receiveShadow = true;
+    const sidewalkR = sidewalkL.clone();
+    sidewalkR.position.z = 7;
+    this.cityGroup.add(sidewalkL, sidewalkR);
+
+    // Road lane markings
+    const lineMat = new THREE.MeshStandardMaterial({ color: 0xf5d142, emissive: 0x6a5a1a, emissiveIntensity: 0.6 });
+    for (let i = -WORLD_HALF + 5; i < WORLD_HALF; i += 6) {
+      const line = new THREE.Mesh(new THREE.BoxGeometry(3, 0.05, 0.4), lineMat);
+      line.rotation.x = -Math.PI / 2;
+      line.position.set(i, 0.03, 0);
+      line.receiveShadow = false;
+      this.cityGroup.add(line);
     }
 
-    this.addProps();
+    // Benches/chairs along sidewalks
+    const benchMat = new THREE.MeshStandardMaterial({ color: 0x5a3b26, roughness: 0.6, metalness: 0.1 });
+    const benchLegMat = new THREE.MeshStandardMaterial({ color: 0x2d2d30, roughness: 0.4, metalness: 0.2 });
+    for (let i = -WORLD_HALF + 10; i <= WORLD_HALF - 10; i += 15) {
+      const seat = new THREE.Mesh(new THREE.BoxGeometry(3, 0.25, 0.8), benchMat);
+      seat.position.set(i, 0.5, -7 - 0.4);
+      const back = new THREE.Mesh(new THREE.BoxGeometry(3, 1, 0.2), benchMat);
+      back.position.set(i, 1, -7 - 1.0);
+      const leg1 = new THREE.Mesh(new THREE.CylinderGeometry(0.12, 0.12, 0.6, 8), benchLegMat);
+      leg1.position.set(i - 1.2, 0.3, -7 - 0.2);
+      const leg2 = leg1.clone(); leg2.position.x = i + 1.2;
+      [seat, back, leg1, leg2].forEach((m) => { m.castShadow = true; m.receiveShadow = true; });
+      this.cityGroup.add(seat, back, leg1, leg2);
+
+      const seat2 = seat.clone(); seat2.position.z = 7 + 0.4;
+      const back2 = back.clone(); back2.position.z = 7 + 1.0;
+      const leg3 = leg1.clone(); leg3.position.z = 7 + 0.2; leg3.position.x = i - 1.2;
+      const leg4 = leg2.clone(); leg4.position.z = 7 + 0.2; leg4.position.x = i + 1.2;
+      this.cityGroup.add(seat2, back2, leg3, leg4);
+    }
+
+    // Simple street lamps
+    const lampPoleMat = new THREE.MeshStandardMaterial({ color: 0x444444, metalness: 0.4, roughness: 0.5 });
+    const lampHeadMat = new THREE.MeshStandardMaterial({ color: 0xf2f2d0, emissive: 0xf2e6b1, emissiveIntensity: 1.5 });
+    for (let i = -WORLD_HALF + 12; i <= WORLD_HALF - 12; i += 18) {
+      const pole = new THREE.Mesh(new THREE.CylinderGeometry(0.2, 0.25, 6, 10), lampPoleMat);
+      pole.position.set(i, 3, -9.5);
+      const head = new THREE.Mesh(new THREE.BoxGeometry(0.8, 0.4, 0.8), lampHeadMat);
+      head.position.set(i, 6.3, -9.5);
+      pole.castShadow = true; pole.receiveShadow = true;
+      head.castShadow = true; head.receiveShadow = true;
+      this.cityGroup.add(pole, head);
+
+      const pole2 = pole.clone(); pole2.position.z = 9.5;
+      const head2 = head.clone(); head2.position.z = 9.5;
+      this.cityGroup.add(pole2, head2);
+    }
+
+    // Trees for atmosphere
+    const trunkMat = new THREE.MeshStandardMaterial({ color: 0x5b3924, roughness: 0.8 });
+    const leafMat = new THREE.MeshStandardMaterial({ color: 0x2f6b34, roughness: 0.6 });
+    for (let i = -WORLD_HALF + 8; i <= WORLD_HALF - 8; i += 16) {
+      const trunk = new THREE.Mesh(new THREE.CylinderGeometry(0.4, 0.5, 4, 8), trunkMat);
+      trunk.position.set(i, 2, -WORLD_HALF + 8);
+      const canopy = new THREE.Mesh(new THREE.SphereGeometry(2.4, 10, 10), leafMat);
+      canopy.position.set(i, 4.6, -WORLD_HALF + 8);
+      trunk.castShadow = true; trunk.receiveShadow = true;
+      canopy.castShadow = true; canopy.receiveShadow = true;
+      this.cityGroup.add(trunk, canopy);
+
+      const trunk2 = trunk.clone(); trunk2.position.z = WORLD_HALF - 8;
+      const canopy2 = canopy.clone(); canopy2.position.z = WORLD_HALF - 8;
+      this.cityGroup.add(trunk2, canopy2);
+    }
+
+    // Simple building blocks
+    const buildingColors = [0xc1c7d0, 0xa6b1c0, 0xd8d2c4, 0xb0c4b1];
+    for (let i = -WORLD_HALF + 12; i <= WORLD_HALF - 12; i += 20) {
+      const color = buildingColors[Math.floor(Math.random() * buildingColors.length)];
+      const height = 8 + Math.random() * 10;
+      const bldgMat = new THREE.MeshStandardMaterial({ color, roughness: 0.6, metalness: 0.1 });
+      const bldg = new THREE.Mesh(new THREE.BoxGeometry(10, height, 12), bldgMat);
+      bldg.position.set(i, height / 2, -WORLD_HALF + 20);
+      bldg.castShadow = true; bldg.receiveShadow = true;
+      this.cityGroup.add(bldg);
+
+      const bldg2 = bldg.clone();
+      bldg2.position.z = WORLD_HALF - 20;
+      this.cityGroup.add(bldg2);
+    }
   }
 
-  private buildPerimeter(wallMat: THREE.MeshStandardMaterial) {
-    const thickness = 1.2;
-    const h = this.wallHeight;
-    const length = ARENA_SIZE + thickness * 2;
-    const wallGeomX = new THREE.BoxGeometry(length, h, thickness);
-    const wallGeomZ = new THREE.BoxGeometry(thickness, h, length);
-
-    const north = new THREE.Mesh(wallGeomX, wallMat);
-    north.position.set(0, h / 2, WORLD_HALF);
-    const south = new THREE.Mesh(wallGeomX, wallMat);
-    south.position.set(0, h / 2, -WORLD_HALF);
-    const east = new THREE.Mesh(wallGeomZ, wallMat);
-    east.position.set(WORLD_HALF, h / 2, 0);
-    const west = new THREE.Mesh(wallGeomZ, wallMat);
-    west.position.set(-WORLD_HALF, h / 2, 0);
-
-    [north, south, east, west].forEach((w) => {
-      w.castShadow = true;
-      w.receiveShadow = true;
-      this.scene.add(w);
+  private buildSky() {
+    // Simple bright sky dome for campus environment
+    const skyGeo = new THREE.SphereGeometry(300, 32, 32);
+    const skyMat = new THREE.ShaderMaterial({
+      side: THREE.BackSide,
+      uniforms: {
+        topColor: { value: new THREE.Color(0x0077ff) },      // bright blue
+        bottomColor: { value: new THREE.Color(0xffffff) },   // white horizon
+      },
+      vertexShader: `
+        varying vec3 vWorldPosition;
+        void main() {
+          vec4 worldPosition = modelMatrix * vec4(position, 1.0);
+          vWorldPosition = worldPosition.xyz;
+          gl_Position = projectionMatrix * modelViewMatrix * vec4(position, 1.0);
+        }
+      `,
+      fragmentShader: `
+        uniform vec3 topColor;
+        uniform vec3 bottomColor;
+        varying vec3 vWorldPosition;
+        void main() {
+          float h = normalize(vWorldPosition).y;
+          vec3 skyColor = mix(bottomColor, topColor, max(h, 0.0));
+          gl_FragColor = vec4(skyColor, 1.0);
+        }
+      `
     });
-  }
-
-  private makeWall([minX, maxX, minZ, maxZ]: WallRect, wallMat: THREE.MeshStandardMaterial) {
-    const w = maxX - minX;
-    const d = maxZ - minZ;
-    const mesh = new THREE.Mesh(new THREE.BoxGeometry(w, this.wallHeight, d), wallMat);
-    mesh.position.set((minX + maxX) / 2, this.wallHeight / 2, (minZ + maxZ) / 2);
-    mesh.castShadow = true;
-    mesh.receiveShadow = true;
-
-    const cap = new THREE.Mesh(
-      new THREE.BoxGeometry(w, 0.2, d),
-      new THREE.MeshStandardMaterial({ color: 0x5c1f1f, emissive: 0x220d0d, metalness: 0.32, roughness: 0.35 })
-    );
-    cap.position.set(mesh.position.x, mesh.position.y + this.wallHeight / 2 - 0.1, mesh.position.z);
-    cap.castShadow = false;
-    cap.receiveShadow = false;
-    this.scene.add(cap);
-
-    return mesh;
-  }
-
-  private addProps() {
-    const crateTex = makeNoiseTexture(0x1a0f0a, 3, 0.18);
-    crateTex.repeat.set(2, 2);
-    const crateMat = new THREE.MeshStandardMaterial({
-      map: crateTex,
-      metalness: 0.45,
-      roughness: 0.65,
-      emissive: 0x1a0505,
-      emissiveIntensity: 0.12
-    });
-    const crates: Array<{ x: number; y: number; z: number; minX: number; maxX: number; minZ: number; maxZ: number; h: number }> = [
-      { x: -14, y: 0.8, z: -14, minX: -14.7, maxX: -13.3, minZ: -14.7, maxZ: -13.3, h: 1.4 },
-      { x: 14, y: 0.8, z: 14, minX: 13.3, maxX: 14.7, minZ: 13.3, maxZ: 14.7, h: 1.4 },
-      { x: -5, y: 0.8, z: -17, minX: -5.7, maxX: -4.3, minZ: -17.7, maxZ: -16.3, h: 1.4 },
-      { x: 5, y: 0.8, z: 17, minX: 4.3, maxX: 5.7, minZ: 16.3, maxZ: 17.7, h: 1.4 },
-      { x: 0, y: 0.8, z: 0, minX: -0.7, maxX: 0.7, minZ: -0.7, maxZ: 0.7, h: 1.4 },
-    ];
-    crates.forEach((c) => {
-      const mesh = new THREE.Mesh(new THREE.BoxGeometry(c.maxX - c.minX, c.h, c.maxZ - c.minZ), crateMat);
-      mesh.position.set(c.x, c.y, c.z);
-      mesh.castShadow = true;
-      mesh.receiveShadow = true;
-      this.scene.add(mesh);
-    });
+    const sky = new THREE.Mesh(skyGeo, skyMat);
+    this.scene.add(sky);
   }
 
   private buildGun() {
     const gun = new THREE.Group();
-    const weapon = this.createShotgun(true, 1);
-    weapon.position.set(0.42, -0.45, -1.05);
-    weapon.rotation.set(-0.18, 0.3, 0.04);
+    // Classic DOOM-inspired right-hand carry with reduced scale.
+    const weapon = this.createShotgun(true, 0.9);
+    weapon.position.set(0.46, -0.58, -1.12);
+    weapon.rotation.set(-0.2, 0.28, -0.05);
     gun.add(weapon);
     this.camera.add(gun);
     this.gun = gun;
@@ -373,65 +360,95 @@ export class Renderer {
 
   private createShotgun(firstPerson: boolean, scale: number) {
     const group = new THREE.Group();
-    const baseColor = firstPerson ? 0x8f8a7a : 0x6f6a5c;
-    const accentColor = 0xd14c1f;
-    const bodyMat = new THREE.MeshStandardMaterial({ color: baseColor, metalness: 0.22, roughness: 0.45 });
-    const barrelMat = new THREE.MeshStandardMaterial({ color: 0x1e1c1c, metalness: 0.6, roughness: 0.35 });
-    const pumpMat = new THREE.MeshStandardMaterial({ color: 0x8c3b1a, metalness: 0.1, roughness: 0.6 });
+    const metal = new THREE.MeshStandardMaterial({ color: 0x1a1a1c, metalness: 0.65, roughness: 0.32 });
+    const steel = new THREE.MeshStandardMaterial({ color: 0x2a2a30, metalness: 0.9, roughness: 0.18 });
+    const polymer = new THREE.MeshStandardMaterial({ color: firstPerson ? 0x2c2f33 : 0x32363b, metalness: 0.05, roughness: 0.6 });
+    const gripMat = new THREE.MeshStandardMaterial({ color: 0x1f1f23, metalness: 0.08, roughness: 0.75 });
+    const accent = new THREE.MeshStandardMaterial({ color: 0xba3c1c, metalness: 0.2, roughness: 0.4 });
 
-    const body = new THREE.Mesh(new THREE.BoxGeometry(0.38 * scale, 0.18 * scale, 0.9 * scale), bodyMat);
-    body.position.set(0, -0.05 * scale, -0.3 * scale);
+    // Receiver / body
+    const receiver = new THREE.Mesh(new THREE.BoxGeometry(0.44 * scale, 0.16 * scale, 0.78 * scale), polymer);
+    receiver.position.set(0, -0.04 * scale, -0.25 * scale);
 
-    const stock = new THREE.Mesh(new THREE.BoxGeometry(0.32 * scale, 0.18 * scale, 0.55 * scale), bodyMat);
-    stock.position.set(-0.08 * scale, -0.06 * scale, 0.35 * scale);
-    stock.rotation.set(0.06, -0.1, 0.02);
+    // Stock + buttpad
+    const stock = new THREE.Mesh(new THREE.BoxGeometry(0.28 * scale, 0.16 * scale, 0.5 * scale), polymer);
+    stock.position.set(-0.12 * scale, -0.06 * scale, 0.34 * scale);
+    stock.rotation.set(0.08, -0.08, 0.02);
+    const butt = new THREE.Mesh(new THREE.BoxGeometry(0.3 * scale, 0.18 * scale, 0.08 * scale), gripMat);
+    butt.position.set(-0.12 * scale, -0.07 * scale, 0.62 * scale);
 
-    const barrel = new THREE.Mesh(new THREE.CylinderGeometry(0.06 * scale, 0.06 * scale, 1.25 * scale, 10), barrelMat);
+    // Barrel and magazine tube
+    const barrelLen = 1.12 * scale;
+    const barrel = new THREE.Mesh(new THREE.CylinderGeometry(0.045 * scale, 0.045 * scale, barrelLen, 14), steel);
     barrel.rotation.x = Math.PI / 2;
-    barrel.position.set(0, 0.06 * scale, -0.95 * scale);
+    barrel.position.set(0, 0.05 * scale, -0.85 * scale);
+    const mag = new THREE.Mesh(new THREE.CylinderGeometry(0.035 * scale, 0.035 * scale, barrelLen * 0.82, 12), metal);
+    mag.rotation.x = Math.PI / 2;
+    mag.position.set(0, -0.02 * scale, -0.72 * scale);
 
-    const pump = new THREE.Mesh(new THREE.BoxGeometry(0.32 * scale, 0.16 * scale, 0.34 * scale), pumpMat);
-    pump.position.set(0, -0.04 * scale, -0.65 * scale);
+    // Pump grip with ribs
+    const pump = new THREE.Mesh(new THREE.BoxGeometry(0.32 * scale, 0.16 * scale, 0.32 * scale), gripMat);
+    pump.position.set(0, -0.02 * scale, -0.62 * scale);
+    const ribs: THREE.Mesh[] = [];
+    for (let i = -2; i <= 2; i++) {
+      const rib = new THREE.Mesh(new THREE.BoxGeometry(0.34 * scale, 0.02 * scale, 0.025 * scale), metal);
+      rib.position.set(0, 0.06 * scale, -0.62 * scale + i * 0.055 * scale);
+      ribs.push(rib);
+    }
 
-    const shellRack = new THREE.Mesh(
-      new THREE.BoxGeometry(0.28 * scale, 0.08 * scale, 0.22 * scale),
-      new THREE.MeshStandardMaterial({ color: accentColor, metalness: 0.35, roughness: 0.42 })
-    );
-    shellRack.position.set(0.08 * scale, 0.08 * scale, -0.05 * scale);
+    // Top rail and sights
+    const rail = new THREE.Mesh(new THREE.BoxGeometry(0.12 * scale, 0.03 * scale, 0.36 * scale), steel);
+    rail.position.set(0, 0.08 * scale, -0.38 * scale);
+    const frontSight = new THREE.Mesh(new THREE.BoxGeometry(0.03 * scale, 0.05 * scale, 0.05 * scale), steel);
+    frontSight.position.set(0, 0.1 * scale, -0.98 * scale);
+    const rearSight = new THREE.Mesh(new THREE.BoxGeometry(0.05 * scale, 0.05 * scale, 0.05 * scale), steel);
+    rearSight.position.set(0, 0.09 * scale, -0.15 * scale);
 
-    const strap = new THREE.Mesh(
-      new THREE.BoxGeometry(0.14 * scale, 0.04 * scale, 0.8 * scale),
-      new THREE.MeshStandardMaterial({ color: 0x1c1819, metalness: 0.15, roughness: 0.7 })
-    );
-    strap.position.set(-0.12 * scale, -0.12 * scale, -0.2 * scale);
-    strap.rotation.set(0.15, 0.2, -0.05);
+    // Shell holder (side saddle)
+    const saddle = new THREE.Mesh(new THREE.BoxGeometry(0.2 * scale, 0.06 * scale, 0.12 * scale), polymer);
+    saddle.position.set(0.14 * scale, 0.0, -0.18 * scale);
+    const shells: THREE.Mesh[] = [];
+    for (let i = 0; i < 4; i++) {
+      const shell = new THREE.Mesh(new THREE.CylinderGeometry(0.018 * scale, 0.018 * scale, 0.06 * scale, 10), accent);
+      shell.rotation.z = Math.PI / 2;
+      shell.position.set(0.14 * scale, -0.015 * scale + i * 0.022 * scale, -0.23 * scale);
+      shells.push(shell);
+    }
 
-    [body, stock, barrel, pump, shellRack, strap].forEach((m) => {
+    // Grip / trigger guard
+    const grip = new THREE.Mesh(new THREE.BoxGeometry(0.12 * scale, 0.22 * scale, 0.12 * scale), gripMat);
+    grip.position.set(0.02 * scale, -0.18 * scale, 0.02 * scale);
+    const guard = new THREE.Mesh(new THREE.TorusGeometry(0.08 * scale, 0.018 * scale, 6, 12, Math.PI), metal);
+    guard.rotation.x = Math.PI / 2;
+    guard.position.set(0.02 * scale, -0.1 * scale, -0.04 * scale);
+
+    const parts = [receiver, stock, butt, barrel, mag, pump, rail, frontSight, rearSight, saddle, grip, guard, ...ribs, ...shells];
+    parts.forEach((m) => {
       m.castShadow = true;
       m.receiveShadow = true;
+      group.add(m);
     });
 
-    group.add(body, stock, barrel, pump, shellRack, strap);
-
-    const muzzle = new THREE.Mesh(new THREE.ConeGeometry(0.13 * scale, 0.22 * scale, 6), new THREE.MeshBasicMaterial({ color: 0xffc277 }));
+    // Muzzle flash anchor at barrel tip
+    const muzzle = new THREE.Mesh(new THREE.ConeGeometry(0.16 * scale, 0.32 * scale, 10), new THREE.MeshBasicMaterial({ color: 0xffc277 }));
     muzzle.rotation.x = Math.PI;
-    muzzle.position.set(0, 0.02 * scale, -1.55 * scale);
+    muzzle.position.set(0, 0.05 * scale, -0.85 * scale - barrelLen * 0.5);
     muzzle.visible = firstPerson;
     group.add(muzzle);
 
     if (firstPerson) {
-      const leftHand = new THREE.Mesh(new THREE.BoxGeometry(0.22, 0.14, 0.18), new THREE.MeshStandardMaterial({ color: 0xdcc8b1, roughness: 0.6 }));
-      leftHand.position.set(-0.22, -0.16, -0.3);
-      leftHand.rotation.set(-0.3, 0.4, 0.5);
-      const rightHand = new THREE.Mesh(new THREE.BoxGeometry(0.22, 0.14, 0.18), new THREE.MeshStandardMaterial({ color: 0xdcc8b1, roughness: 0.6 }));
-      rightHand.position.set(0.1, -0.18, 0.18);
-      rightHand.rotation.set(-0.08, -0.1, -0.3);
+      const leftHand = new THREE.Mesh(new THREE.BoxGeometry(0.18, 0.12, 0.16), new THREE.MeshStandardMaterial({ color: 0xdcc8b1, roughness: 0.6 }));
+      leftHand.position.set(-0.16, -0.18, -0.52);
+      leftHand.rotation.set(-0.35, 0.45, 0.4);
+      const rightHand = new THREE.Mesh(new THREE.BoxGeometry(0.18, 0.12, 0.16), new THREE.MeshStandardMaterial({ color: 0xdcc8b1, roughness: 0.6 }));
+      rightHand.position.set(0.1, -0.2, 0.06);
+      rightHand.rotation.set(-0.12, -0.12, -0.35);
       group.add(leftHand, rightHand);
       this.pumpHandle = pump;
 
-      const flash = new THREE.Mesh(new THREE.ConeGeometry(0.3, 0.5, 6), new THREE.MeshBasicMaterial({ color: 0xffb347, transparent: true, opacity: 0.9 }));
+      const flash = new THREE.Mesh(new THREE.ConeGeometry(0.34, 0.55, 10), new THREE.MeshBasicMaterial({ color: 0xffb347, transparent: true, opacity: 0.9 }));
       flash.rotation.x = Math.PI;
-      flash.position.set(0, 0.04, -1.6 * scale);
+      flash.position.copy(muzzle.position).add(new THREE.Vector3(0, 0, -0.05));
       flash.visible = false;
       group.add(flash);
       this.muzzleFlash = flash;
@@ -440,10 +457,10 @@ export class Renderer {
     return group;
   }
 
-  private createPlayerMesh(): MeshEntry {
+  private createPlayerMesh(): MeshEntry | null {
     if (this.baseModel && this.baseModelGltf) {
       const cloned = SkeletonUtils.clone(this.baseModel) as THREE.Group;
-      cloned.scale.set(0.8, 0.8, 0.8);
+      cloned.scale.set(1.05, 1.05, 1.05);
       cloned.rotation.y = Math.PI; // face down -Z to match forward
       cloned.position.y = 0;
       const tintMats: THREE.MeshStandardMaterial[] = [];
@@ -452,27 +469,25 @@ export class Renderer {
         if (mesh.isMesh && mesh.material) {
           const mat = mesh.material as THREE.MeshStandardMaterial;
           mat.color.setHex(HUMAN_COLOR);
-          mat.metalness = 0.42;
-          mat.roughness = 0.38;
-          mat.emissive.setHex(0x1a2415);
-          mat.emissiveIntensity = 0.15;
+          mat.metalness = 0.35;
+          mat.roughness = 0.42;
+          mat.emissive.setHex(0x0f1a0f);
+          mat.emissiveIntensity = 0.1;
           mat.needsUpdate = true;
           tintMats.push(mat);
         }
       });
-      const weapon = this.createShotgun(false, 0.75);
-      weapon.position.set(0.45, 1.15, -0.3);
-      weapon.rotation.set(0.0, Math.PI, 0); // barrel forward
+      const weapon = this.createShotgun(false, 0.7);
+      weapon.position.set(0.24, 0.9, 0.15);
+      weapon.rotation.set(0.0, Math.PI * 1.02, 0); // flip to face forward
       weapon.castShadow = true;
       weapon.receiveShadow = true;
       cloned.add(weapon);
       cloned.userData.tintMats = tintMats;
 
-      // Create animation manager for this player
       const animManager = new AnimationManager(this.baseModelGltf);
-      // Start with idle animation if available
-      if (animManager.hasAnimation("idle")) {
-        animManager.playAnimation("idle", true);
+      if (animManager.hasAnimation("Idle")) {
+        animManager.playAnimation("Idle", true);
       }
 
       return {
@@ -484,54 +499,8 @@ export class Renderer {
         animManager,
       };
     }
-
-    const group = new THREE.Group();
-    const bodyMat = new THREE.MeshStandardMaterial({
-      color: HUMAN_COLOR,
-      metalness: 0.42,
-      roughness: 0.38,
-      emissive: 0x1a2415,
-      emissiveIntensity: 0.15
-    });
-    const accentMat = new THREE.MeshStandardMaterial({
-      color: 0x262020,
-      metalness: 0.48,
-      roughness: 0.35,
-      emissive: 0x0a0404,
-      emissiveIntensity: 0.12
-    });
-
-    const legs = new THREE.Mesh(new THREE.BoxGeometry(0.82, 0.6, 0.42), accentMat);
-    legs.position.y = 0.3;
-    const torso = new THREE.Mesh(new THREE.BoxGeometry(0.9, 1.0, 0.5), bodyMat);
-    torso.position.y = 1.0;
-    const chest = new THREE.Mesh(new THREE.BoxGeometry(0.9, 0.3, 0.54), accentMat);
-    chest.position.set(0, 1.3, 0.04);
-
-    const head = new THREE.Mesh(new THREE.BoxGeometry(0.42, 0.42, 0.42), accentMat);
-    head.position.y = 1.75;
-    const visor = new THREE.Mesh(
-      new THREE.BoxGeometry(0.38, 0.16, 0.04),
-      new THREE.MeshStandardMaterial({ color: 0xf1c27d, emissive: 0xaa4f1a, emissiveIntensity: 0.55, roughness: 0.28, metalness: 0.32 })
-    );
-    visor.position.set(0, 1.75, 0.23);
-
-    const leftArm = new THREE.Mesh(new THREE.BoxGeometry(0.2, 0.6, 0.22), bodyMat);
-    leftArm.position.set(-0.55, 1.0, 0.05);
-    const rightArm = new THREE.Mesh(new THREE.BoxGeometry(0.2, 0.6, 0.22), bodyMat);
-    rightArm.position.set(0.55, 1.0, 0.05);
-
-    const weapon = this.createShotgun(false, 0.65);
-    weapon.position.set(0.4, 1.05, -0.25);
-    weapon.rotation.set(0.0, Math.PI, 0);
-
-    [legs, torso, chest, head, visor, leftArm, rightArm, weapon].forEach((m) => {
-      m.castShadow = true;
-      m.receiveShadow = true;
-    });
-
-    group.add(legs, torso, chest, head, visor, leftArm, rightArm, weapon);
-    return { mesh: group, weapon, bodyMat, accentMat, bobPhase: Math.random() * Math.PI * 2 };
+    // Character model not ready; skip rendering placeholders.
+    return null;
   }
 
   private loadAudio() {
@@ -554,8 +523,11 @@ export class Renderer {
 
   private loadCharacterModel() {
     const loader = new GLTFLoader();
+    const draco = new DRACOLoader();
+    draco.setDecoderPath("/draco/");
+    loader.setDRACOLoader(draco);
     loader.load(
-      "/models/CesiumMan.glb",
+      "/models/asian_male_animated.glb",
       (gltf) => {
         this.baseModel = gltf.scene;
         this.baseModelGltf = gltf;
@@ -601,10 +573,11 @@ export class Renderer {
     const pumpBackDur = 0.12;
     const pumpFwdDur = 0.16;
     const travel = 0.22;
+    const pumpBaseZ = -0.62;
     if (this.pumpPhase === 1) {
       this.pumpTime += delta;
       const t = Math.min(1, this.pumpTime / pumpBackDur);
-      this.pumpHandle.position.z = -0.65 - travel * t;
+      this.pumpHandle.position.z = pumpBaseZ - travel * t;
       if (t >= 1) {
         this.pumpPhase = 2;
         this.pumpTime = 0;
@@ -616,11 +589,11 @@ export class Renderer {
     } else if (this.pumpPhase === 2) {
       this.pumpTime += delta;
       const t = Math.min(1, this.pumpTime / pumpFwdDur);
-      this.pumpHandle.position.z = -0.65 - travel * (1 - t);
+      this.pumpHandle.position.z = pumpBaseZ - travel * (1 - t);
       if (t >= 1) {
         this.pumpPhase = 0;
         this.pumpTime = 0;
-        this.pumpHandle.position.z = -0.65;
+        this.pumpHandle.position.z = pumpBaseZ;
       }
     }
   }
@@ -631,5 +604,9 @@ export class Renderer {
     this.camera.aspect = w / h;
     this.camera.updateProjectionMatrix();
     this.renderer.setSize(w, h);
+    this.composer.setSize(w, h);
+    this.bloomPass.setSize(w, h);
   }
 }
+
+
